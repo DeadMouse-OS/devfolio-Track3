@@ -1,10 +1,8 @@
-# app.py
 import os
 import json
-import time
-import uuid
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import boto3
 import numpy as np
@@ -14,270 +12,347 @@ from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import StandardScaler
 
-# --------- Configuration from env ----------
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+
+
+# ==================== Config ====================
+
 TABLE_NAME = os.environ.get("TABLE_NAME", "FinancialAnomalies")
-TOPIC_ARN = os.environ.get("TOPIC_ARN")  # SNS FIFO or standard
+TOPIC_ARN = os.environ.get("TOPIC_ARN")
+S3_BUCKET = os.environ.get("S3_BUCKET", "financial-anomaly-reports")
+
 TICKER = os.environ.get("TICKER", "AAPL")
-FETCH_PERIOD = os.environ.get("FETCH_PERIOD", "2d")  # e.g., "1d","2d"
-FETCH_INTERVAL = os.environ.get("FETCH_INTERVAL", "1m")  # "1m", "5m"
-ROLLING_WINDOW = int(os.environ.get("ROLLING_WINDOW", "20"))  # window for rolling stats
-CONTAMINATION = float(os.environ.get("CONTAMINATION", "0.02"))  # for iso forest
-BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "amazon.titan-embed-text")  # replace with textual model id
+FETCH_PERIOD = os.environ.get("FETCH_PERIOD", "2d")
+FETCH_INTERVAL = os.environ.get("FETCH_INTERVAL", "1m")
+ROLLING_WINDOW = int(os.environ.get("ROLLING_WINDOW", "20"))
+CONTAMINATION = float(os.environ.get("CONTAMINATION", "0.02"))
 
-# --------- AWS clients ----------
 dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(TABLE_NAME)
 sns = boto3.client("sns")
-# Bedrock runtime client (requires aws-sdk version that supports bedrock-runtime)
-bedrock = boto3.client("bedrock-runtime")  # may require correct region/permissions
+s3 = boto3.client("s3")
 
-# --------- Logging ----------
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
-# --------- Utilities ----------
+# ==================== Data stuff ====================
+
 def fetch_data(ticker=TICKER, period=FETCH_PERIOD, interval=FETCH_INTERVAL):
-    """
-    Fetch intraday data via yfinance. Returns pandas DataFrame with Datetime index.
-    """
-    df = yf.download(tickers=ticker, period=period, interval=interval, progress=False)
-    if df is None or df.empty:
+    """Grab price data from Yahoo Finance"""
+    try:
+        df = yf.download(tickers=ticker, period=period, interval=interval, progress=False)
+        
+        if df is None or df.empty:
+            logger.warning(f"Got nothing back for {ticker}")
+            return pd.DataFrame()
+        
+        df = df.reset_index()
+        
+        # Yahoo returns different column names depending on interval
+        if 'Datetime' in df.columns:
+            df.rename(columns={'Datetime': 'timestamp'}, inplace=True)
+        elif 'Date' in df.columns:
+            df.rename(columns={'Date': 'timestamp'}, inplace=True)
+        
+        logger.info(f"Grabbed {len(df)} rows for {ticker}")
+        return df
+        
+    except Exception as e:
+        logger.error(f"Couldn't fetch data for {ticker}: {str(e)}")
         return pd.DataFrame()
-    df = df.reset_index()
-    # standardize column names
-    df.rename(columns={"Datetime": "Datetime", "Open": "Open", "High": "High",
-                       "Low": "Low", "Close": "Close", "Volume": "Volume"}, inplace=True)
-    return df
 
 
-def add_derived_features(df):
-    """
-    Add returns, HL gap, OC gap and rolling volatility.
-    """
-    df = df.copy()
-    df["return"] = df["Close"].pct_change()
-    df["hl_gap"] = df["High"] - df["Low"]
-    df["oc_gap"] = df["Open"] - df["Close"]
-    df["volatility"] = df["return"].rolling(ROLLING_WINDOW).std()
+def add_features(df):
+    """Calculate returns, gaps, volatility - the usual suspects"""
+    df['return'] = df['Close'].pct_change()
+    df['hl_gap'] = df['High'] - df['Low']
+    df['oc_gap'] = df['Open'] - df['Close']
+    df['volatility'] = df['return'].rolling(window=ROLLING_WINDOW, min_periods=1).std()
+    
     df.dropna(inplace=True)
     return df
 
 
-def rolling_standardize_single_point(df_window, features):
-    """
-    Given a DataFrame window (shape >= 1), fit a StandardScaler on the window (excluding
-    the last row optionally) and return scaled last-row feature vector. We'll scale using
-    the previous window (past data) then compute features for the newest point.
-    """
+# ==================== ML detection ====================
+
+def standardize(df_window, features):
+    """Scale features to mean=0, std=1 so they're comparable"""
     scaler = StandardScaler()
     X = df_window[features].values
-    scaler.fit(X)
-    X_scaled = scaler.transform(X)
-    return X_scaled  # returns all rows scaled (we will take last)
+    return scaler.fit_transform(X)
 
 
-def ensemble_anomaly_score(X_window, contamination=CONTAMINATION):
+def get_anomaly_scores(X_window):
     """
-    Fit lightweight ensemble detectors on the window and return anomaly flags for the last row.
-    We fit on the whole window to learn normal behavior and mark the points that are outliers.
+    Run two different anomaly detectors and combine them.
+    IsolationForest is good for big outliers.
+    LOF catches local weirdness.
     """
-    # Use IsolationForest + LocalOutlierFactor (LOF)
-    iso = IsolationForest(contamination=contamination, random_state=42, n_estimators=200)
-    lof = LocalOutlierFactor(n_neighbors=20, contamination=contamination, novelty=False)
-
-    # Fit iso on X and get scores
+    iso = IsolationForest(contamination=CONTAMINATION, random_state=42)
     iso.fit(X_window)
-    iso_scores = -iso.score_samples(X_window)  # higher => more anomalous
-
-    # LOF is unsupervised; fit_predict returns -1 for outliers
+    iso_scores = -iso.score_samples(X_window)
+    
+    lof = LocalOutlierFactor(n_neighbors=20, contamination=CONTAMINATION, novelty=False)
     lof_labels = lof.fit_predict(X_window)
-    # Convert LOF to numeric anomaly score: outlier (-1) -> 1, normal (1) -> 0
     lof_scores = (lof_labels == -1).astype(float)
+    
+    # Normalize ISO scores to 0-1 range
+    iso_min, iso_max = np.min(iso_scores), np.max(iso_scores)
+    iso_norm = (iso_scores - iso_min) / (iso_max - iso_min + 1e-9)
+    
+    # Weight ISO more heavily (60/40 split)
+    combined = 0.6 * iso_norm + 0.4 * lof_scores
+    
+    return combined
 
-    # Combine scores: normalize iso_scores to 0-1
-    iso_norm = (iso_scores - np.min(iso_scores)) / (np.max(iso_scores) - np.min(iso_scores) + 1e-9)
-    combined = 0.6 * iso_norm + 0.4 * lof_scores  # weighted ensemble
 
-    return combined  # array same length as X_window; larger => more anomalous
-
-
-def detect_latest_anomaly(df, features):
-    """
-    Use rolling standardization + ensemble detection on the most recent window and decide
-    whether latest row is anomalous. Returns anomaly dict if anomalous, else None.
-    """
+def check_for_anomaly(df, features):
+    """Look at the most recent data point and see if it's weird"""
     if len(df) < ROLLING_WINDOW + 1:
+        logger.warning(f"Not enough data: {len(df)} points, need at least {ROLLING_WINDOW + 1}")
         return None
-
-    # select last window rows (we include last)
+    
+    # Grab a window including the latest point
     window_df = df.iloc[-(ROLLING_WINDOW + 1):].copy().reset_index(drop=True)
-    # standardize on the window except: fit on all rows (this simulates using only past info in real streaming)
-    X_scaled = rolling_standardize_single_point(window_df, features)
-    scores = ensemble_anomaly_score(X_scaled, contamination=CONTAMINATION)
-
+    
+    X_scaled = standardize(window_df, features)
+    scores = get_anomaly_scores(X_scaled)
+    
     latest_score = float(scores[-1])
-    # define threshold: choose percentiles dynamically
-    thresh = np.percentile(scores, 100 * (1 - CONTAMINATION))
-    is_anomaly = latest_score >= thresh
-
-    if not is_anomaly:
+    threshold = np.percentile(scores, 100 * (1 - CONTAMINATION))
+    
+    if latest_score < threshold:
+        logger.info(f"Score {latest_score:.3f} is below threshold {threshold:.3f}, all good")
         return None
-
-    # prepare anomaly details for latest point
+    
+    logger.warning(f"Found anomaly! Score: {latest_score:.3f} vs threshold {threshold:.3f}")
+    
     latest_row = window_df.iloc[-1].to_dict()
+    
     return {
         "score": latest_score,
-        "threshold": float(thresh),
+        "threshold": float(threshold),
         "latest": latest_row,
-        "window_stats": {
-            "mean_scores": float(np.mean(scores)),
-            "max_score": float(np.max(scores))
-        }
+        "window_scores": scores.tolist()
     }
 
 
-def build_event_payload(ticker, anomaly, df):
-    """
-    Build structured JSON context for Bedrock summarizer and for logging.
-    """
-    latest = anomaly["latest"]
-    ts = latest.get("Datetime") if "Datetime" in latest else latest.get("datetime", None)
-    if isinstance(ts, (pd.Timestamp, )):
-        ts = ts.isoformat()
-    payload = {
-        "timestamp": ts,
-        "ticker": ticker,
-        "anomaly_score": anomaly["score"],
-        "threshold": anomaly["threshold"],
-        "price": {
-            "open": float(latest["Open"]),
-            "high": float(latest["High"]),
-            "low": float(latest["Low"]),
-            "close": float(latest["Close"])
-        },
-        "volume": float(latest["Volume"]),
-        "return": float(latest.get("return", 0.0)),
-        "hl_gap": float(latest.get("hl_gap", 0.0)),
-        "oc_gap": float(latest.get("oc_gap", 0.0)),
-        "context_summary": f"rolling_window={ROLLING_WINDOW}"
-    }
-    return payload
+# ==================== Reporting ====================
 
-
-def call_bedrock_summarizer(event_payload, model_id=BEDROCK_MODEL_ID, temperature=0.0):
-    """
-    Call Bedrock runtime to summarize event_payload. This code uses the bedrock-runtime invoke_model
-    interface. Adjust the request/response parsing for the model you pick.
-    NOTE: You must have permissions to call bedrock-runtime and valid model id in your account.
-    """
-    # Build a human-friendly prompt
-    prompt = f"""
-You are a concise professional financial analyst. Given this event JSON, summarize in 2-3 sentences:
-Event: {json.dumps(event_payload)}
-Produce: a short title (7-10 words) and then a concise one-sentence explanation of likely cause & recommendation.
-Return JSON with keys: title, summary, severity(1-10).
-"""
+def make_report(ticker, anomaly, df, summary):
+    """Generate a PDF with charts and details"""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    report_name = f"{ticker}_anomaly_{timestamp}.pdf"
+    report_path = os.path.join("/tmp", report_name)
+    
     try:
-        # Bedrock runtime expects a specific content-type and model Id. This code may need small edits
-        # depending on the Bedrock model you select. See AWS Bedrock docs for exact fields.
-        resp = bedrock.invoke_model(
-            modelId=model_id,
-            body=json.dumps({"input": prompt, "temperature": temperature}),
-            contentType="application/json",
-            accept="application/json"
+        doc = SimpleDocTemplate(report_path, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = []
+        
+        # Title and header info
+        story.append(Paragraph(f"<b>Anomaly Alert: {ticker}</b>", styles["Title"]))
+        story.append(Spacer(1, 12))
+        story.append(Paragraph(
+            f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}", 
+            styles["Normal"]
+        ))
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(f"<b>Score:</b> {anomaly['score']:.3f}", styles["Normal"]))
+        story.append(Paragraph(f"<b>Threshold:</b> {anomaly['threshold']:.3f}", styles["Normal"]))
+        story.append(Paragraph(
+            f"<b>What happened:</b> {summary.get('summary', 'Unusual pattern detected')}", 
+            styles["Normal"]
+        ))
+        story.append(Spacer(1, 20))
+        
+        # Make a chart
+        plt.figure(figsize=(7, 4))
+        plt.plot(df["timestamp"], df["Close"], label="Close Price", color="#2563eb", linewidth=2)
+        plt.scatter(
+            df["timestamp"].iloc[-1], 
+            df["Close"].iloc[-1], 
+            color="#ef4444", 
+            label="Anomaly", 
+            s=100, 
+            zorder=5
         )
-        body_bytes = resp["body"].read()
-        text = body_bytes.decode("utf-8")
-        # many Bedrock models return text; assume they return a JSON-like text. Try parse, else fallback to raw.
-        try:
-            parsed = json.loads(text)
-            return parsed
-        except Exception:
-            # fallback: return the raw model text as summary
-            return {"title": "Anomaly detected", "summary": text, "severity": 5}
+        plt.xlabel("Time")
+        plt.ylabel("Price ($)")
+        plt.title(f"{ticker} Price Chart")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        chart_path = f"/tmp/{ticker}_chart.png"
+        plt.savefig(chart_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        
+        story.append(Image(chart_path, width=450, height=250))
+        story.append(Spacer(1, 12))
+        
+        # Add a table with the data
+        story.append(Paragraph("<b>Data Point Details</b>", styles["Heading2"]))
+        story.append(Spacer(1, 8))
+        
+        table_data = [["Feature", "Value"]]
+        for k, v in anomaly["latest"].items():
+            if isinstance(v, (int, float, Decimal)):
+                table_data.append([str(k), f"{float(v):.4f}"])
+            else:
+                table_data.append([str(k), str(v)])
+        
+        t = Table(table_data, colWidths=[200, 200])
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1f2937')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 11),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f3f4f6')),
+            ('GRID', (0, 0), (-1, -1), 1, colors.grey)
+        ]))
+        
+        story.append(t)
+        doc.build(story)
+        
+        logger.info(f"Report saved: {report_path}")
+        return report_path
+        
     except Exception as e:
-        logger.exception("Bedrock summarizer failed")
-        return {"title": "LLM error", "summary": f"Bedrock error: {e}", "severity": 5}
+        logger.error(f"Failed to make report: {str(e)}")
+        raise
 
 
-def put_to_dynamo(table_name, event_payload, summary):
-    """
-    Write anomaly record to DynamoDB table.
-    Table schema: partition key -> ticker (string); sort key -> timestamp (string)
-    """
-    table = dynamodb.Table(table_name)
-    item = {
-        "ticker": event_payload["ticker"],
-        "timestamp": event_payload["timestamp"],
-        "price": event_payload["price"],
-        "volume": Decimal_or_float(event_payload["volume"]),
-        "return": Decimal_or_float(event_payload["return"]),
-        "anomaly_score": Decimal_or_float(event_payload["anomaly_score"]),
-        "summary_title": summary.get("title"),
-        "summary_text": summary.get("summary"),
-        "severity": Decimal_or_float(summary.get("severity", 5))
-    }
-    table.put_item(Item=item)
+def upload_to_s3(file_path, bucket, prefix="reports/"):
+    """Upload report to S3"""
+    filename = os.path.basename(file_path)
+    key = f"{prefix}{filename}"
+    
+    try:
+        s3.upload_file(file_path, bucket, key)
+        uri = f"s3://{bucket}/{key}"
+        logger.info(f"Uploaded to {uri}")
+        return uri
+    except Exception as e:
+        logger.error(f"S3 upload failed: {str(e)}")
+        raise
 
 
-def Decimal_or_float(v):
-    # DynamoDB requires decimal for exactness; boto3 can accept floats but if you prefer Decimal convert.
-    # To keep code simple, we'll return float.
-    return float(v)
+def save_to_dynamo(ticker, anomaly, report_url):
+    """Store anomaly record for later analysis"""
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        
+        item = {
+            'id': f"{ticker}_{now}",
+            'ticker': ticker,
+            'timestamp': now,
+            'anomaly_score': Decimal(str(anomaly['score'])),
+            'threshold': Decimal(str(anomaly['threshold'])),
+            'report_url': report_url,
+            'close_price': Decimal(str(anomaly['latest'].get('Close', 0))),
+            'volume': int(anomaly['latest'].get('Volume', 0))
+        }
+        
+        table.put_item(Item=item)
+        logger.info(f"Saved to DynamoDB: {item['id']}")
+        
+    except Exception as e:
+        logger.error(f"DynamoDB write failed: {str(e)}")
+        # Don't crash on this, it's not critical
 
 
-def publish_sns(topic_arn, message, message_group_id=None):
-    kwargs = {"TopicArn": topic_arn, "Message": message, "Subject": "Anomaly Alert"}
-    if topic_arn.endswith(".fifo"):
-        # FIFO requires MessageGroupId and (optionally) DeduplicationId
-        kwargs["MessageGroupId"] = message_group_id or "default"
-        kwargs["MessageDeduplicationId"] = str(uuid.uuid4())
-    resp = sns.publish(**kwargs)
-    return resp
+# ==================== Main handler ====================
 
-
-# ---------- Lambda handler ----------
-def lambda_handler(event, context):
-    """
-    Main entrypoint — can be called by EventBridge scheduled rule with payload {"ticker": "AAPL"}.
-    """
+def lambda_handler(event, context=None):
+    """Main entry point - gets called by Lambda or EventBridge"""
+    
     ticker = event.get("ticker", TICKER) if isinstance(event, dict) else TICKER
-    logger.info(f"Running anomaly check for {ticker} at {datetime.now(timezone.utc).isoformat()}")
-
-    # Step 1: fetch and prepare
-    df = fetch_data(ticker=ticker)
+    logger.info(f"Running detection for {ticker}")
+    
+    # Get the data
+    df = fetch_data(ticker)
     if df.empty:
-        logger.warning("No data fetched")
-        return {"status": "no_data"}
-
-    df = add_derived_features(df)
-    if df.empty:
-        logger.warning("No usable data after feature engineering")
-        return {"status": "no_data_post_fe"}
-
-    # Step 2: features to use
+        logger.error("No data returned, bailing out")
+        return {"status": "no_data", "ticker": ticker}
+    
+    # Add features
+    df = add_features(df)
+    
+    # Run detection
     features = ["Open", "High", "Low", "Close", "Volume", "return", "hl_gap", "oc_gap", "volatility"]
-    # ensure features exist
-    available_feats = [f for f in features if f in df.columns]
-    anomaly = detect_latest_anomaly(df[available_feats], available_feats)
+    anomaly = check_for_anomaly(df, features)
+    
     if not anomaly:
-        logger.info("No anomaly found.")
-        return {"status": "no_anomaly"}
-
-    # Step 3: build event payload and summarize via Bedrock
-    event_payload = build_event_payload(ticker, anomaly, df)
-    summary = call_bedrock_summarizer(event_payload)
-
-    # Step 4: store and publish
+        logger.info("Everything looks normal")
+        return {"status": "no_anomaly", "ticker": ticker}
+    
+    # Build a summary
+    latest = anomaly['latest']
+    price_pct = ((latest['Close'] - latest['Open']) / latest['Open']) * 100
+    vol_str = f"{latest['Volume']:,.0f}"
+    deviation = anomaly['score'] - anomaly['threshold']
+    
+    summary = {
+        "summary": (
+            f"Caught something unusual in {ticker}. "
+            f"Price moved {price_pct:+.2f}% on volume of {vol_str}. "
+            f"Anomaly score exceeded threshold by {deviation:.2f} points."
+        )
+    }
+    
+    # Make the report
     try:
-        put_to_dynamo(TABLE_NAME, event_payload, summary)
+        report_path = make_report(ticker, anomaly, df, summary)
+        report_url = upload_to_s3(report_path, S3_BUCKET)
     except Exception as e:
-        logger.exception("Failed to write to DynamoDB")
+        logger.error(f"Report generation bombed: {str(e)}")
+        return {"status": "error", "ticker": ticker, "error": str(e)}
+    
+    # Store it
+    save_to_dynamo(ticker, anomaly, report_url)
+    
+    # Send alert
+    if TOPIC_ARN:
+        try:
+            msg = (
+                f"🚨 Anomaly Alert\n\n"
+                f"Ticker: {ticker}\n"
+                f"Score: {anomaly['score']:.3f}\n"
+                f"Threshold: {anomaly['threshold']:.3f}\n\n"
+                f"{summary['summary']}\n\n"
+                f"Report: {report_url}"
+            )
+            
+            sns.publish(
+                TopicArn=TOPIC_ARN,
+                Message=msg,
+                Subject=f"🚨 {ticker} Anomaly"
+            )
+            logger.info("Alert sent")
+        except Exception as e:
+            logger.error(f"SNS publish failed: {str(e)}")
+    
+    return {
+        "status": "anomaly_reported",
+        "ticker": ticker,
+        "anomaly_score": anomaly['score'],
+        "summary": summary,
+        "report_url": report_url
+    }
 
-    try:
-        message = f"{summary.get('title','Anomaly')} | {summary.get('summary')}"
-        publish_sns(TOPIC_ARN, message, message_group_id=ticker)
-    except Exception:
-        logger.exception("Failed to publish SNS message")
 
-    return {"status": "anomaly_reported", "summary": summary}
+if __name__ == "__main__":
+    # Quick test run
+    result = lambda_handler({"ticker": "AAPL"})
+    print(json.dumps(result, indent=2, default=str))
